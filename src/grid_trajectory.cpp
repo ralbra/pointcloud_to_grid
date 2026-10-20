@@ -234,7 +234,7 @@ private:
           if (p.y > grid_map.bottomright_y && p.y < grid_map.topleft_y)
           {
             PointXY cell = grid_map.getIndex(p.x, p.y);
-            if (cell.x < grid_map.cell_num_x && cell.y < grid_map.cell_num_y)
+            if (grid_map.isValidCell(cell))
             {
               ipoints[cell.y * grid_map.cell_num_x + cell.x] = char(p.intensity * grid_map.intensity_factor);
               hpoints[cell.y * grid_map.cell_num_x + cell.x] = +99; // char(p.z * grid_map.height_factor);

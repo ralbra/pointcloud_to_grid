@@ -3,6 +3,9 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "grid_map_msgs/msg/grid_map.hpp"
 #include <memory>
+#include <cmath>
+#include <string>
+
 class PointXY
 {
 public:
@@ -142,12 +145,20 @@ public:
     return cell_size;
   }
 
-  // x and y are in meters, it returs the cell index
-  PointXY getIndex(double x, double y)
+  // x and y are in meters. Cell (0, 0) is the top-left corner (max x, max y)
+  // and indices grow towards -x / -y. Points outside the grid give negative
+  // or too-large indices, so check the result with isValidCell() before use.
+  PointXY getIndex(double x, double y) const
   {
     PointXY ret;
-    ret.x = int(fabs(x - topleft_x) / cell_size);
-    ret.y = int(fabs(y - topleft_y) / cell_size);
+    ret.x = static_cast<int>(std::floor((topleft_x - x) / cell_size));
+    ret.y = static_cast<int>(std::floor((topleft_y - y) / cell_size));
     return ret;
+  }
+
+  // True if the cell lies inside the grid
+  bool isValidCell(const PointXY &cell) const
+  {
+    return cell.x >= 0 && cell.x < cell_num_x && cell.y >= 0 && cell.y < cell_num_y;
   }
 };

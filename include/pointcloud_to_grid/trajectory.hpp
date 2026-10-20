@@ -7,6 +7,8 @@
 #include <functional>
 #include <iostream>
 
+#include "pointcloud_to_grid/pointcloud_to_grid_core.hpp"
+
 // Extending the GridMap class
 class GridMapTrajectory : public GridMap
 {
@@ -41,7 +43,7 @@ public:
 
         while (true)
         {
-            if (x0 >= 0 && x0 < cell_num_x && y0 >= 0 && y0 < cell_num_y)
+            if (isValidCell({x0, y0}))
             {   
                 if (grid_points[y0 * cell_num_x + x0] > 50)
                 {

@@ -6,7 +6,7 @@
 
 
 
-void init_debug_marker(visualization_msgs::msg::Marker& debug_marker, double pose_x, double pose_y, int id){
+inline void init_debug_marker(visualization_msgs::msg::Marker& debug_marker, double pose_x, double pose_y, int id){
     debug_marker.ns = "debug" + std::to_string(id);
     debug_marker.type = visualization_msgs::msg::Marker::CYLINDER;
     debug_marker.action = visualization_msgs::msg::Marker::MODIFY;
@@ -24,7 +24,7 @@ void init_debug_marker(visualization_msgs::msg::Marker& debug_marker, double pos
     // debug_marker.points.clear();
 }
 
-void init_text_debug_marker(visualization_msgs::msg::Marker& debug_marker){
+inline void init_text_debug_marker(visualization_msgs::msg::Marker& debug_marker){
     debug_marker.ns = "debug_text";
     debug_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
     debug_marker.action = visualization_msgs::msg::Marker::MODIFY;

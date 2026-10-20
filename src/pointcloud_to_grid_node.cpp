@@ -316,7 +316,7 @@ private:
       }
 
       const PointXY cell = grid_map.getIndex(px, py);
-      if (cell.x >= grid_map.cell_num_x || cell.y >= grid_map.cell_num_y)
+      if (!grid_map.isValidCell(cell))
       {
         RCLCPP_WARN_STREAM(this->get_logger(), "Cell out of range: " << cell.x << " - " << grid_map.cell_num_x << " ||| " << cell.y << " - " << grid_map.cell_num_y);
         continue;

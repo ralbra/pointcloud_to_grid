@@ -80,6 +80,7 @@ install(TARGETS
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)          # added
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
@@ -88,6 +89,21 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+  
+  # unit test for the value reader
+  ament_add_gtest(test_value_source test/test_value_source.cpp)
+  ament_target_dependencies(test_value_source sensor_msgs)
+
+  # unit tests for the grid classes
+  foreach(test_name test_grid_map test_trajectory test_marker)
+    ament_add_gtest(${test_name} test/${test_name}.cpp)
+    ament_target_dependencies(${test_name}
+      rclcpp nav_msgs grid_map_msgs visualization_msgs)
+  endforeach()
+
+  #target_include_directories(test_value_source PUBLIC
+  #  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  #  $<INSTALL_INTERFACE:include>)
 endif()
 
 ament_package()
