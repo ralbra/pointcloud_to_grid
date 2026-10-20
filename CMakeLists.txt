@@ -90,15 +90,11 @@ if(BUILD_TESTING)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
   
-  # unit test for the value reader
-  ament_add_gtest(test_value_source test/test_value_source.cpp)
-  ament_target_dependencies(test_value_source sensor_msgs)
-
-  # unit tests for the grid classes
-  foreach(test_name test_grid_map test_trajectory test_marker)
+  # unit tests
+  foreach(test_name test_grid_map test_trajectory test_marker test_grid_processing test_value_source)
     ament_add_gtest(${test_name} test/${test_name}.cpp)
     ament_target_dependencies(${test_name}
-      rclcpp nav_msgs grid_map_msgs visualization_msgs)
+      rclcpp sensor_msgs nav_msgs grid_map_msgs visualization_msgs)
   endforeach()
 
   #target_include_directories(test_value_source PUBLIC
