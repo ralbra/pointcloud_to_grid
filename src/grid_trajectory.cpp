@@ -66,7 +66,7 @@ class PointCloudToGrid : public rclcpp::Node
         auto sensor_qos = rclcpp::QoS(10).reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
         sub_pc2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             cloud_in_topic, sensor_qos, 
-            std::bind(&PointCloudToGrid::lidar_callback, this, std::placeholders::_1));
+            std::bind(&PointCloudToGrid::pointCloudCallback, this, std::placeholders::_1));
       }
       if (param.get_name() == "cell_size")
       {
@@ -179,7 +179,7 @@ public:
     auto sensor_qos = rclcpp::QoS(10).reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
     sub_pc2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
         cloud_in_topic, sensor_qos, 
-        std::bind(&PointCloudToGrid::lidar_callback, this, std::placeholders::_1));
+        std::bind(&PointCloudToGrid::pointCloudCallback, this, std::placeholders::_1));
     callback_handle_ = this->add_on_set_parameters_callback(std::bind(&PointCloudToGrid::parametersCallback, this, std::placeholders::_1));
     RCLCPP_INFO_STREAM(this->get_logger(), "pointcloud_to_grid_node has been started.");
     RCLCPP_INFO_STREAM(this->get_logger(), "Subscribing to: " << cloud_in_topic.c_str());
@@ -200,7 +200,7 @@ private:
     return cloud_cropped;
   }
 
-  void lidar_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_msg)
+  void pointCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_msg)
   {
     pcl::PointCloud<pcl::PointXYZI>::Ptr out_cloud(new pcl::PointCloud<pcl::PointXYZI>);
     pcl::fromROSMsg(*input_msg, *out_cloud);

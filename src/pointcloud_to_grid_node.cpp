@@ -14,6 +14,7 @@
 // From this ROS package
 #include <pointcloud_to_grid/pointcloud_to_grid_core.hpp>
 #include <pointcloud_to_grid/value_reader.hpp>
+#include <pointcloud_to_grid/grid_processing.hpp>
 // c++
 #include <cstdint>
 #include <limits>
@@ -25,6 +26,13 @@
 #include <vector>
 #include <algorithm>
 
+
+using pointcloud_to_grid::RetainedGrid;
+using pointcloud_to_grid::cloudValidationError;
+using pointcloud_to_grid::cloudTimeNs;
+using pointcloud_to_grid::accumulatePoints;
+using pointcloud_to_grid::fillOccupancyGrid;
+using pointcloud_to_grid::fillGridMap;
 using pointcloud_to_grid::ValueSource; 
 using pointcloud_to_grid::ValueReader;
 
@@ -69,7 +77,7 @@ class PointCloudToGrid : public rclcpp::Node
         auto sensor_qos = rclcpp::QoS(10).reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
         sub_pc2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             cloud_in_topic, sensor_qos,
-            std::bind(&PointCloudToGrid::lidar_callback, this, std::placeholders::_1));
+            std::bind(&PointCloudToGrid::pointCloudCallback, this, std::placeholders::_1));
       }
       if (param.get_name() == "cell_size")
       {
@@ -124,9 +132,8 @@ class PointCloudToGrid : public rclcpp::Node
         }
       }
       grid_map.paramRefresh();
-      ipoints_.clear();   // grid may have moved or resized: forget retained cells
-      hpoints_.clear();
-      cell_stamp_ns_.clear();
+      // grid may have moved or resized: forget retained cells
+      retained_.clear();
     }
     return result;
   }
@@ -179,7 +186,7 @@ public:
     auto sensor_qos = rclcpp::QoS(10).reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
     sub_pc2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
         cloud_in_topic, sensor_qos,
-        std::bind(&PointCloudToGrid::lidar_callback, this, std::placeholders::_1));
+        std::bind(&PointCloudToGrid::pointCloudCallback, this, std::placeholders::_1));
     callback_handle_ = this->add_on_set_parameters_callback(std::bind(&PointCloudToGrid::parametersCallback, this, std::placeholders::_1));
     RCLCPP_INFO_STREAM(this->get_logger(), "pointcloud_to_grid_node has been started.");
     RCLCPP_INFO_STREAM(this->get_logger(), "Subscribing to: " << cloud_in_topic.c_str());
@@ -190,140 +197,6 @@ public:
   }
 
 private:
-   // ---------- small stateless helpers ----------
-  static bool hasField(const sensor_msgs::msg::PointCloud2 &cloud, const std::string &name)
-  {
-    return std::any_of(cloud.fields.begin(), cloud.fields.end(),
-                       [&name](const sensor_msgs::msg::PointField &f) { return f.name == name; });
-  }
-
-  static std::string listFields(const sensor_msgs::msg::PointCloud2 &cloud)
-  {
-    std::string out;
-    for (const auto &f : cloud.fields)
-    {
-      out += (out.empty() ? "" : ", ") + f.name;
-    }
-    return out;
-  }
-
-  // ---------- validation and time ----------
-  bool validateCloud(const sensor_msgs::msg::PointCloud2 &cloud, ValueSource source) const
-  {
-    if (!hasField(cloud, "x") || !hasField(cloud, "y"))
-    {
-      RCLCPP_ERROR(this->get_logger(), "Incoming PointCloud2 is missing 'x' or 'y' field. Skipping frame.");
-      return false;
-    }
-    if (!hasField(cloud, source.physicalFieldName()))
-    {
-      RCLCPP_ERROR(this->get_logger(),
-                   "Requested value_field '%s' not found in incoming PointCloud2. "
-                   "Available fields: [%s]. Skipping frame.",
-                   value_field.c_str(), listFields(cloud).c_str());
-      return false;
-    }
-    return true;
-  }
-
-  // Message stamp in ns, falling back to the node clock if the stamp is unset
-  int64_t cloudTimeNs(const sensor_msgs::msg::PointCloud2 &cloud) const
-  {
-    rclcpp::Time stamp(cloud.header.stamp, RCL_ROS_TIME);
-    if (stamp.nanoseconds() == 0)
-    {
-      stamp = this->now();
-    }
-    return stamp.nanoseconds();
-  }
-
-  // ---------- retention state ----------
-  // Returns false if the grid has no cells (invalid size/cell_size parameters)
-  bool prepareRetentionState()
-  {
-    if (grid_map.cell_num_x <= 0 || grid_map.cell_num_y <= 0)
-    {
-      return false;
-    }
-    const size_t n_cells = static_cast<size_t>(grid_map.cell_num_x) * grid_map.cell_num_y;
-    if (ipoints_.size() != n_cells)
-    {
-      ipoints_.assign(n_cells, -128);
-      hpoints_.assign(n_cells, -128);
-      cell_stamp_ns_.assign(n_cells, kNoStamp);
-    }
-    return true;
-  }
-
-  // With retention_time_ == 0 every cell expires, which reproduces the
-  // previous behaviour. age < 0 means time jumped backwards (e.g. bag loop).
-  void expireCells(int64_t now_ns)
-  {
-    const int64_t retention_ns = static_cast<int64_t>(retention_time_ * 1e9);
-    for (size_t i = 0; i < cell_stamp_ns_.size(); ++i)
-    {
-      if (cell_stamp_ns_[i] == kNoStamp)
-      {
-        continue;
-      }
-      const int64_t age_ns = now_ns - cell_stamp_ns_[i];
-      if (age_ns < 0 || age_ns >= retention_ns)
-      {
-        ipoints_[i] = -128;
-        hpoints_[i] = -128;
-        cell_stamp_ns_[i] = kNoStamp;
-      }
-    }
-  }
-
-  // ---------- point accumulation ----------
-  // True if (x, y) lies inside the grid area and not on the x ~ 0 axis
-  bool isInsideGrid(float x, float y) const
-  {
-    if (std::abs(x) <= 0.01f)
-    {
-      return false;
-    }
-    return x > grid_map.bottomright_x && x < grid_map.topleft_x &&
-           y > grid_map.bottomright_y && y < grid_map.topleft_y;
-  }
-
-  void writeCell(const PointXY &cell, float value, int64_t now_ns)
-  {
-    const size_t idx = static_cast<size_t>(cell.y) * grid_map.cell_num_x + cell.x;
-    ipoints_[idx] = value * grid_map.intensity_factor;
-    hpoints_[idx] = value * grid_map.height_factor;
-    cell_stamp_ns_[idx] = now_ns;
-  }
-
-  void accumulatePoints(const sensor_msgs::msg::PointCloud2 &cloud, ValueSource source, int64_t now_ns)
-  {
-    sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
-    ValueReader reader(cloud, source);
-
-    for (; iter_x != iter_x.end(); ++iter_x, ++iter_y)
-    {
-      // Always read the value, even if the point is skipped below,
-      // so the value iterator stays in step with x and y.
-      const float value = reader.next();
-      const float px = *iter_x;
-      const float py = *iter_y;
-
-      if (!isInsideGrid(px, py))
-      {
-        continue;
-      }
-
-      const PointXY cell = grid_map.getIndex(px, py);
-      if (!grid_map.isValidCell(cell))
-      {
-        RCLCPP_WARN_STREAM(this->get_logger(), "Cell out of range: " << cell.x << " - " << grid_map.cell_num_x << " ||| " << cell.y << " - " << grid_map.cell_num_y);
-        continue;
-      }
-      writeCell(cell, value, now_ns);
-    }
-  }
 
   // ---------- grid messages and publishing ----------
   void initGridMessages()
@@ -334,34 +207,13 @@ private:
     grid_map.initGridMap(height_gridmap, "height");
   }
 
-  void fillOccupancyGrid(nav_msgs::msg::OccupancyGrid &grid,
-                         const std::vector<signed char> &cells,
-                         const std::string &frame_id)
-  {
-    grid.header.stamp = this->now();
-    grid.header.frame_id = frame_id;
-    grid.info.map_load_time = this->now();
-    grid.data = cells;
-  }
-
-  void fillGridMap(grid_map_msgs::msg::GridMap &msg,
-                   const std::vector<signed char> &cells,
-                   const std::string &frame_id)
-  {
-    msg.header.stamp = this->now();
-    msg.header.frame_id = frame_id;
-    for (size_t i = 0; i < cells.size(); ++i)
-    {
-      msg.data[0].data[i] = static_cast<float>(cells[i]) / 127.0f;
-    }
-  }
-
   void publishGrids(const std::string &frame_id)
   {
-    fillOccupancyGrid(*intensity_grid, ipoints_, frame_id);
-    fillOccupancyGrid(*height_grid, hpoints_, frame_id);
-    fillGridMap(*intensity_gridmap, ipoints_, frame_id);
-    fillGridMap(*height_gridmap, hpoints_, frame_id);
+    const builtin_interfaces::msg::Time stamp = this->now();
+    fillOccupancyGrid(*intensity_grid, retained_.intensity(), frame_id, stamp);
+    fillOccupancyGrid(*height_grid, retained_.height(), frame_id, stamp);
+    fillGridMap(*intensity_gridmap, retained_.intensity(), frame_id, stamp);
+    fillGridMap(*height_gridmap, retained_.height(), frame_id, stamp);
 
     pub_hgrid->publish(*height_grid);
     pub_igrid->publish(*intensity_grid);
@@ -374,19 +226,24 @@ private:
     }
   }
 
-  // ---------- the callback itself ----------
   void
-  lidar_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_msg)
+  pointCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_msg)
   {
-    const ValueSource source(value_field);    
-    if (!validateCloud(*input_msg, source)) { return; }
-    if (!prepareRetentionState()) { return; }
+    const ValueSource source(value_field);
+
+    const std::string error = cloudValidationError(*input_msg, source);
+    if (!error.empty())
+    {
+      RCLCPP_ERROR(this->get_logger(), "%s Skipping frame.", error.c_str());
+      return;
+    }
+    if (!retained_.prepare(grid_map.cell_num_x, grid_map.cell_num_y)) { return; }
 
     initGridMessages();
 
-    const int64_t now_ns = cloudTimeNs(*input_msg);
-    expireCells(now_ns);
-    accumulatePoints(*input_msg, source, now_ns);
+    const int64_t now_ns = cloudTimeNs(*input_msg, this->now().nanoseconds());
+    retained_.expire(now_ns, static_cast<int64_t>(retention_time_ * 1e9));
+    accumulatePoints(*input_msg, source, grid_map, retained_, now_ns);
     publishGrids(input_msg->header.frame_id);
   }
 
@@ -405,10 +262,8 @@ private:
   size_t count_;
   
   //point retention state (persists between clouds) ---
-  static constexpr int64_t kNoStamp = std::numeric_limits<int64_t>::min();
   double retention_time_ = 0.0;                 // seconds; 0 = no retention (old behaviour)
-  std::vector<signed char> ipoints_, hpoints_;  // retained cells (-128 = unknown)
-  std::vector<int64_t> cell_stamp_ns_;          // time each cell was last written
+  RetainedGrid retained_;
 };
 int main(int argc, char **argv)
 {
