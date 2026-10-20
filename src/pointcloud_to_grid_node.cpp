@@ -11,8 +11,9 @@
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/crop_box.h>
-// ROS package
+// From this ROS package
 #include <pointcloud_to_grid/pointcloud_to_grid_core.hpp>
+#include <pointcloud_to_grid/value_reader.hpp>
 // c++
 #include <cstdint>
 #include <limits>
@@ -23,6 +24,9 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+
+using pointcloud_to_grid::ValueSource; 
+using pointcloud_to_grid::ValueReader;
 
 auto height_grid = std::make_shared<nav_msgs::msg::OccupancyGrid>();
 auto intensity_grid = std::make_shared<nav_msgs::msg::OccupancyGrid>();
@@ -186,7 +190,8 @@ public:
   }
 
 private:
-   static bool hasField(const sensor_msgs::msg::PointCloud2 &cloud, const std::string &name)
+   // ---------- small stateless helpers ----------
+  static bool hasField(const sensor_msgs::msg::PointCloud2 &cloud, const std::string &name)
   {
     return std::any_of(cloud.fields.begin(), cloud.fields.end(),
                        [&name](const sensor_msgs::msg::PointField &f) { return f.name == name; });
@@ -202,66 +207,60 @@ private:
     return out;
   }
 
-    void
-  lidar_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_msg)
+  // ---------- validation and time ----------
+  bool validateCloud(const sensor_msgs::msg::PointCloud2 &cloud, ValueSource source) const
   {
-    // --- Validate required fields ---
-    if (!hasField(*input_msg, "x") || !hasField(*input_msg, "y"))
+    if (!hasField(cloud, "x") || !hasField(cloud, "y"))
     {
       RCLCPP_ERROR(this->get_logger(), "Incoming PointCloud2 is missing 'x' or 'y' field. Skipping frame.");
-      return;
+      return false;
     }
-
-    const bool use_height = (value_field == "z" || value_field == "height");
-    const bool use_rgb_channel = (value_field == "r" || value_field == "g" || value_field == "b");
-
-    // Physical field that must exist in the cloud: "z" for height, the packed
-    // "rgb" for r/g/b channels, otherwise the requested field itself.
-    const std::string physical_field =
-        use_height ? "z" : (use_rgb_channel ? "rgb" : value_field);
-
-    if (!hasField(*input_msg, physical_field))
+    if (!hasField(cloud, source.physicalFieldName()))
     {
       RCLCPP_ERROR(this->get_logger(),
                    "Requested value_field '%s' not found in incoming PointCloud2. "
                    "Available fields: [%s]. Skipping frame.",
-                   value_field.c_str(), listFields(*input_msg).c_str());
-      return;
+                   value_field.c_str(), listFields(cloud).c_str());
+      return false;
     }
+    return true;
+  }
 
+  // Message stamp in ns, falling back to the node clock if the stamp is unset
+  int64_t cloudTimeNs(const sensor_msgs::msg::PointCloud2 &cloud) const
+  {
+    rclcpp::Time stamp(cloud.header.stamp, RCL_ROS_TIME);
+    if (stamp.nanoseconds() == 0)
+    {
+      stamp = this->now();
+    }
+    return stamp.nanoseconds();
+  }
+
+  // ---------- retention state ----------
+  // Returns false if the grid has no cells (invalid size/cell_size parameters)
+  bool prepareRetentionState()
+  {
     if (grid_map.cell_num_x <= 0 || grid_map.cell_num_y <= 0)
     {
-      return;
+      return false;
     }
     const size_t n_cells = static_cast<size_t>(grid_map.cell_num_x) * grid_map.cell_num_y;
-
-    // Initialize grid messages
-    grid_map.initGrid(intensity_grid);
-    grid_map.initGrid(height_grid);
-    grid_map.initGridMap(intensity_gridmap, "intensity");
-    grid_map.initGridMap(height_gridmap, "height");
-
-    // --- Point retention ---
-    // (Re)initialise retained state on first use or after a size change
     if (ipoints_.size() != n_cells)
     {
       ipoints_.assign(n_cells, -128);
       hpoints_.assign(n_cells, -128);
       cell_stamp_ns_.assign(n_cells, kNoStamp);
     }
+    return true;
+  }
 
-    // Time base: message stamp, falling back to the node clock if unset
-    rclcpp::Time stamp(input_msg->header.stamp, RCL_ROS_TIME);
-    if (stamp.nanoseconds() == 0)
-    {
-      stamp = this->now();
-    }
-    const int64_t now_ns = stamp.nanoseconds();
+  // With retention_time_ == 0 every cell expires, which reproduces the
+  // previous behaviour. age < 0 means time jumped backwards (e.g. bag loop).
+  void expireCells(int64_t now_ns)
+  {
     const int64_t retention_ns = static_cast<int64_t>(retention_time_ * 1e9);
-
-    // Expire old cells. With retention_ns == 0 every cell expires, which
-    // reproduces the previous behaviour. age < 0 means time jumped backwards.
-    for (size_t i = 0; i < n_cells; ++i)
+    for (size_t i = 0; i < cell_stamp_ns_.size(); ++i)
     {
       if (cell_stamp_ns_[i] == kNoStamp)
       {
@@ -275,115 +274,123 @@ private:
         cell_stamp_ns_[i] = kNoStamp;
       }
     }
+  }
 
-    // --- Generic iterators: x, y always; value field chosen at runtime ---
-    sensor_msgs::PointCloud2ConstIterator<float> iter_x(*input_msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_y(*input_msg, "y");
-
-    std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<float>> iter_z;
-    std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<float>> iter_value_float;
-    std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<uint8_t>> iter_value_byte;
-
-    if (use_height)
+  // ---------- point accumulation ----------
+  // True if (x, y) lies inside the grid area and not on the x ~ 0 axis
+  bool isInsideGrid(float x, float y) const
+  {
+    if (std::abs(x) <= 0.01f)
     {
-      iter_z = std::make_unique<sensor_msgs::PointCloud2ConstIterator<float>>(*input_msg, "z");
+      return false;
     }
-    else if (use_rgb_channel)
-    {
-      // "r"/"g"/"b" are pseudo-fields: the iterator unpacks the right byte
-      // from the packed "rgb" float field automatically.
-      iter_value_byte = std::make_unique<sensor_msgs::PointCloud2ConstIterator<uint8_t>>(*input_msg, value_field);
-    }
-    else
-    {
-      // Covers "intensity", "reflectivity", or any other custom FLOAT32 field name.
-      iter_value_float = std::make_unique<sensor_msgs::PointCloud2ConstIterator<float>>(*input_msg, value_field);
-    }
+    return x > grid_map.bottomright_x && x < grid_map.topleft_x &&
+           y > grid_map.bottomright_y && y < grid_map.topleft_y;
+  }
 
-    // --- Write points into the retained cells ---
+  void writeCell(const PointXY &cell, float value, int64_t now_ns)
+  {
+    const size_t idx = static_cast<size_t>(cell.y) * grid_map.cell_num_x + cell.x;
+    ipoints_[idx] = value * grid_map.intensity_factor;
+    hpoints_[idx] = value * grid_map.height_factor;
+    cell_stamp_ns_[idx] = now_ns;
+  }
+
+  void accumulatePoints(const sensor_msgs::msg::PointCloud2 &cloud, ValueSource source, int64_t now_ns)
+  {
+    sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
+    ValueReader reader(cloud, source);
+
     for (; iter_x != iter_x.end(); ++iter_x, ++iter_y)
     {
+      // Always read the value, even if the point is skipped below,
+      // so the value iterator stays in step with x and y.
+      const float value = reader.next();
       const float px = *iter_x;
       const float py = *iter_y;
 
-      // Read and advance the value iterator for every point, even if the
-      // point is skipped below, so it stays in step with x and y.
-      float value = 0.0f;
-      if (use_height)
+      if (!isInsideGrid(px, py))
       {
-        value = **iter_z;
-        ++(*iter_z);
-      }
-      else if (use_rgb_channel)
-      {
-        value = static_cast<float>(**iter_value_byte);
-        ++(*iter_value_byte);
-      }
-      else
-      {
-        value = **iter_value_float;
-        ++(*iter_value_float);
+        continue;
       }
 
-      if (px > 0.01 || px < -0.01)
+      const PointXY cell = grid_map.getIndex(px, py);
+      if (cell.x >= grid_map.cell_num_x || cell.y >= grid_map.cell_num_y)
       {
-        if (px > grid_map.bottomright_x && px < grid_map.topleft_x)
-        {
-          if (py > grid_map.bottomright_y && py < grid_map.topleft_y)
-          {
-            PointXY cell = grid_map.getIndex(px, py);
-            if (cell.x < grid_map.cell_num_x && cell.y < grid_map.cell_num_y)
-            {
-              // --- this is the block that replaces the old two lines ---
-              const size_t idx = static_cast<size_t>(cell.y) * grid_map.cell_num_x + cell.x;
-              ipoints_[idx] = value * grid_map.intensity_factor;
-              hpoints_[idx] = value * grid_map.height_factor;
-              cell_stamp_ns_[idx] = now_ns;
-            }
-            else
-            {
-              RCLCPP_WARN_STREAM(this->get_logger(), "Cell out of range: " << cell.x << " - " << grid_map.cell_num_x << " ||| " << cell.y << " - " << grid_map.cell_num_y);
-            }
-          }
-        }
+        RCLCPP_WARN_STREAM(this->get_logger(), "Cell out of range: " << cell.x << " - " << grid_map.cell_num_x << " ||| " << cell.y << " - " << grid_map.cell_num_y);
+        continue;
       }
+      writeCell(cell, value, now_ns);
     }
+  }
 
-    // --- Publish OccupancyGrids ---
-    intensity_grid->header.stamp = this->now();
-    intensity_grid->header.frame_id = input_msg->header.frame_id;
-    intensity_grid->info.map_load_time = this->now();
-    intensity_grid->data = ipoints_;
-    height_grid->header.stamp = this->now();
-    height_grid->header.frame_id = input_msg->header.frame_id;
-    height_grid->info.map_load_time = this->now();
-    height_grid->data = hpoints_;
+  // ---------- grid messages and publishing ----------
+  void initGridMessages()
+  {
+    grid_map.initGrid(intensity_grid);
+    grid_map.initGrid(height_grid);
+    grid_map.initGridMap(intensity_gridmap, "intensity");
+    grid_map.initGridMap(height_gridmap, "height");
+  }
 
-    // --- Convert to GridMap format ---
-    intensity_gridmap->header.stamp = this->now();
-    intensity_gridmap->header.frame_id = input_msg->header.frame_id;
-    for (size_t i = 0; i < ipoints_.size(); ++i)
+  void fillOccupancyGrid(nav_msgs::msg::OccupancyGrid &grid,
+                         const std::vector<signed char> &cells,
+                         const std::string &frame_id)
+  {
+    grid.header.stamp = this->now();
+    grid.header.frame_id = frame_id;
+    grid.info.map_load_time = this->now();
+    grid.data = cells;
+  }
+
+  void fillGridMap(grid_map_msgs::msg::GridMap &msg,
+                   const std::vector<signed char> &cells,
+                   const std::string &frame_id)
+  {
+    msg.header.stamp = this->now();
+    msg.header.frame_id = frame_id;
+    for (size_t i = 0; i < cells.size(); ++i)
     {
-      intensity_gridmap->data[0].data[i] = static_cast<float>(ipoints_[i]) / 127.0f;
+      msg.data[0].data[i] = static_cast<float>(cells[i]) / 127.0f;
     }
+  }
 
-    height_gridmap->header.stamp = this->now();
-    height_gridmap->header.frame_id = input_msg->header.frame_id;
-    for (size_t i = 0; i < hpoints_.size(); ++i)
-    {
-      height_gridmap->data[0].data[i] = static_cast<float>(hpoints_[i]) / 127.0f;
-    }
+  void publishGrids(const std::string &frame_id)
+  {
+    fillOccupancyGrid(*intensity_grid, ipoints_, frame_id);
+    fillOccupancyGrid(*height_grid, hpoints_, frame_id);
+    fillGridMap(*intensity_gridmap, ipoints_, frame_id);
+    fillGridMap(*height_gridmap, hpoints_, frame_id);
 
     pub_hgrid->publish(*height_grid);
     pub_igrid->publish(*intensity_grid);
     pub_hgridmap->publish(*height_gridmap);
     pub_igridmap->publish(*intensity_gridmap);
+
     if (verbose1)
     {
       RCLCPP_INFO_STREAM(this->get_logger(), "Published " << grid_map.mapi_topic_name.c_str() << " and " << grid_map.maph_topic_name.c_str());
     }
   }
 
+  // ---------- the callback itself ----------
+  void
+  lidar_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_msg)
+  {
+    const ValueSource source(value_field);    
+    if (!validateCloud(*input_msg, source)) { return; }
+    if (!prepareRetentionState()) { return; }
+
+    initGridMessages();
+
+    const int64_t now_ns = cloudTimeNs(*input_msg);
+    expireCells(now_ns);
+    accumulatePoints(*input_msg, source, now_ns);
+    publishGrids(input_msg->header.frame_id);
+  }
+
+  // ---------- variables ----------
   //ros
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_igrid, pub_hgrid;
   rclcpp::Publisher<grid_map_msgs::msg::GridMap>::SharedPtr pub_igridmap, pub_hgridmap;
